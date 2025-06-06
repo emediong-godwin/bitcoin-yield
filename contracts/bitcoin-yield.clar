@@ -82,3 +82,89 @@
     (ok (var-set min-stake-period new-period))
   )
 )
+
+;; REWARD POOL MANAGEMENT
+
+(define-public (add-to-reward-pool (amount uint))
+  (begin
+    (asserts! (> amount u0) ERR_ZERO_STAKE)
+    ;; Transfer sBTC to contract
+    (try! (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token
+      transfer amount tx-sender (as-contract tx-sender) none
+    ))
+    ;; Update reward pool
+    (var-set reward-pool (+ (var-get reward-pool) amount))
+    (ok true)
+  )
+)
+
+;; CORE STAKING FUNCTIONS
+
+(define-public (stake (amount uint))
+  (begin
+    (asserts! (> amount u0) ERR_ZERO_STAKE)
+    ;; Transfer sBTC from user to contract
+    (try! (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token
+      transfer amount tx-sender (as-contract tx-sender) none
+    ))
+    ;; Update or create stake record
+    (match (map-get? stakes { staker: tx-sender })
+      prev-stake (map-set stakes { staker: tx-sender } {
+        amount: (+ amount (get amount prev-stake)),
+        staked-at: stacks-block-height,
+      })
+      (map-set stakes { staker: tx-sender } {
+        amount: amount,
+        staked-at: stacks-block-height,
+      })
+    )
+    ;; Update total staked
+    (var-set total-staked (+ (var-get total-staked) amount))
+    (ok true)
+  )
+)
+
+;; REWARD CALCULATION & DISTRIBUTION
+
+(define-read-only (calculate-rewards (staker principal))
+  (match (map-get? stakes { staker: staker })
+    stake-info (let (
+        (stake-amount (get amount stake-info))
+        (stake-duration (- stacks-block-height (get staked-at stake-info)))
+        (reward-basis (/ (* stake-amount (var-get reward-rate)) u1000))
+        (blocks-per-year u52560) ;; ~365 days on Stacks
+        (time-factor (/ (* stake-duration u10000) blocks-per-year))
+        (reward (* reward-basis (/ time-factor u10000)))
+      )
+      reward
+    )
+    u0
+  )
+)
+
+(define-public (claim-rewards)
+  (let (
+      (stake-info (unwrap! (map-get? stakes { staker: tx-sender }) ERR_NO_STAKE_FOUND))
+      (reward-amount (calculate-rewards tx-sender))
+    )
+    (asserts! (> reward-amount u0) ERR_NO_STAKE_FOUND)
+    (asserts! (<= reward-amount (var-get reward-pool)) ERR_NOT_ENOUGH_REWARDS)
+    ;; Update reward pool
+    (var-set reward-pool (- (var-get reward-pool) reward-amount))
+    ;; Track claimed rewards
+    (match (map-get? rewards-claimed { staker: tx-sender })
+      prev-claimed (map-set rewards-claimed { staker: tx-sender } { amount: (+ reward-amount (get amount prev-claimed)) })
+      (map-set rewards-claimed { staker: tx-sender } { amount: reward-amount })
+    )
+    ;; Reset stake timer
+    (map-set stakes { staker: tx-sender } {
+      amount: (get amount stake-info),
+      staked-at: stacks-block-height,
+    })
+    ;; Transfer rewards to user
+    (as-contract (try! (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token
+      transfer reward-amount (as-contract tx-sender) tx-sender none
+    )))
+    (ok true)
+  )
+)
